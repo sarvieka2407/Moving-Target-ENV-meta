@@ -36,6 +36,17 @@ DEFAULT_EPISODES_PER_ROLLOUT = int(os.getenv("EPISODES_PER_ROLLOUT", "5"))
 DEFAULT_TRAINING_CYCLES = int(os.getenv("TRAINING_CYCLES", "3"))
 
 
+def _resolve_output_dir() -> str:
+    """Pick an output directory that survives restarts on HF Spaces when possible."""
+    env_out = os.getenv("OUTPUT_DIR")
+    if env_out:
+        return env_out
+    # On Spaces with persistent storage, /data is the durable mount.
+    if os.path.isdir("/data"):
+        return "/data/grpo-output"
+    return "grpo-output"
+
+
 # ── server helpers ────────────────────────────────────────────────────────────
 
 def _start_env_server() -> subprocess.Popen:
@@ -93,6 +104,11 @@ def run_training_loop(
     cycles: int = DEFAULT_TRAINING_CYCLES,
     episodes_per_rollout: int = DEFAULT_EPISODES_PER_ROLLOUT,
 ) -> None:
+    output_dir = _resolve_output_dir()
+    resume_path = os.path.join(output_dir, "final-adapter")
+    # Let model_loader auto-resume if adapter exists from previous runs.
+    os.environ["RESUME_ADAPTER_PATH"] = resume_path
+
     # Load the model once — rollout_collector and grpo_trainer both share this cache
     get_model_and_tokenizer()
 
@@ -117,11 +133,11 @@ def run_training_loop(
 
     train_with_grpo(
         rollout_buffer=all_rollouts,
-        output_dir="grpo-output",
+        output_dir=output_dir,
         max_steps=grpo_steps,
     )
     print("[TRAINING] GRPO update complete.", flush=True)
-    print("[TRAINING] Final adapter saved to: grpo-output/final-adapter", flush=True)
+    print(f"[TRAINING] Final adapter saved to: {output_dir}/final-adapter", flush=True)
 
 
 # ── entry point ───────────────────────────────────────────────────────────────

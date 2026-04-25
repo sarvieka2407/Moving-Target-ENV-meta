@@ -19,6 +19,16 @@ _model = None
 _tokenizer = None
 
 
+def _get_resume_adapter_path() -> str | None:
+    """Return adapter path to resume from, if configured and present."""
+    resume_path = os.getenv("RESUME_ADAPTER_PATH", "").strip()
+    if not resume_path:
+        return None
+    if os.path.isdir(resume_path):
+        return resume_path
+    return None
+
+
 def _resolve_hf_model_name(name: str) -> str:
     """Resolve a Hugging Face model id from BASE_MODEL.
 
@@ -48,8 +58,15 @@ def get_model_and_tokenizer():
     if _model is not None:
         return _model, _tokenizer
 
+    resume_adapter = _get_resume_adapter_path()
     use_unsloth = (os.getenv("USE_UNSLOTH", "1").lower() in ("1", "true", "yes", "on"))
-    if torch.cuda.is_available() and use_unsloth:
+
+    # If resuming from an existing adapter, always use HF+PEFT load path
+    # for predictable adapter restore behavior.
+    if resume_adapter:
+        print(f"[MODEL] Found existing adapter, resuming from: {resume_adapter}", flush=True)
+        _load_with_hf(resume_adapter_path=resume_adapter)
+    elif torch.cuda.is_available() and use_unsloth:
         try:
             _load_with_unsloth()
         except Exception as e:
@@ -90,11 +107,11 @@ def _load_with_unsloth():
     _tokenizer = tokenizer
 
 
-def _load_with_hf():
+def _load_with_hf(resume_adapter_path: str | None = None):
     """Load with standard HuggingFace + PEFT (CPU/MPS path — local dev)."""
     global _model, _tokenizer
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import get_peft_model, LoraConfig, TaskType
+    from peft import PeftModel, get_peft_model, LoraConfig, TaskType
 
     hf_name = _resolve_hf_model_name(MODEL_NAME)
     print(f"[MODEL] HF fallback model id: {hf_name}", flush=True)
@@ -110,13 +127,22 @@ def _load_with_hf():
         dtype=torch_dtype,      # `torch_dtype` is deprecated in new transformers
         device_map="auto",
     )
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=16,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_dropout=0.0,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-    )
-    _model = get_peft_model(model, lora_config)
+
+    if resume_adapter_path:
+        # Load previously saved adapter and keep it trainable for continued GRPO.
+        _model = PeftModel.from_pretrained(
+            model,
+            resume_adapter_path,
+            is_trainable=True,
+        )
+    else:
+        lora_config = LoraConfig(
+            r=16,
+            lora_alpha=16,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_dropout=0.0,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        _model = get_peft_model(model, lora_config)
     _tokenizer = tokenizer
