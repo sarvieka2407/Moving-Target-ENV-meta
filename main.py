@@ -93,7 +93,7 @@ if __name__ == "__main__":
         initial_state = {
             "messages": [],
             "current_merchant": "",
-            "last_known_schema": lifelong_memory,
+            "last_known_schema": {},
             "drift_detected": False,
             "reward_score": 0.0,
             "prev_episode_summary": prev_episode_summary,
