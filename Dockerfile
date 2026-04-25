@@ -14,9 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies first for better layer caching
-COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && pip install -r /app/requirements.txt
+# Install Space-specific dependencies first for better layer caching
+COPY requirements-space.txt /app/requirements-space.txt
+RUN pip install --upgrade pip && pip install -r /app/requirements-space.txt
 
 # Copy project code
 COPY . /app

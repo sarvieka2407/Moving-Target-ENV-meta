@@ -1,0 +1,25 @@
+# Minimal dependencies for Hugging Face Space deployment
+
+# Core app/runtime
+openenv-core[core]>=0.2.3
+fastapi>=0.115.0
+uvicorn>=0.24.0
+requests>=2.33.0
+python-dotenv>=1.0.0
+pydantic>=2.8.0
+
+# LangChain / LangGraph used by persona + concierge + watchdog flow
+langchain-openai>=1.1.0
+langchain-core>=1.3.0
+langgraph>=1.1.0
+langgraph-prebuilt>=1.0.0
+
+# GRPO training stack
+torch>=2.4.0
+transformers>=4.45.0
+trl>=1.0.0
+peft>=0.12.0
+datasets>=3.0.0
+accelerate>=1.0.0
+bitsandbytes>=0.44.0
+unsloth

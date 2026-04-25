@@ -6,12 +6,33 @@ from server.Moving_Target_environment import MovingTargetEnv
 import os
 import dotenv
 dotenv.load_dotenv()
-persona_llm = ChatOpenAI(
-    model=os.getenv("MODEL_NAME"),
-    temperature=0.9,
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-)
+
+
+def _get_persona_llm() -> ChatOpenAI:
+    """Build persona LLM lazily using explicit OpenRouter env vars.
+
+    Priority:
+    1) PERSONA_MODEL
+    2) OPENROUTER_MODEL
+    3) MODEL_NAME
+    4) fallback default
+    """
+    model_name = (
+        os.getenv("PERSONA_MODEL")
+        or os.getenv("OPENROUTER_MODEL")
+        or os.getenv("MODEL_NAME")
+        or "openai/gpt-4o-mini"
+    )
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set.")
+
+    return ChatOpenAI(
+        model=model_name,
+        temperature=0.9,
+        base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        api_key=api_key,
+    )
 
 def persona_node(state: AgentState):
     # 1. Randomized Constraint Pool
@@ -37,6 +58,7 @@ def persona_node(state: AgentState):
         "Do not list them as bullet points—act like a human sending a message."
     )
     
+    persona_llm = _get_persona_llm()
     response = persona_llm.invoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content="The simulation has started. Send your request to the assistant.")

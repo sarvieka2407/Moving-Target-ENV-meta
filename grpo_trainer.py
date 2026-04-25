@@ -1,15 +1,10 @@
-"""GRPO training using TRL + Unsloth.
+"""GRPO training using TRL + Unsloth."""
+# Import unsloth FIRST before trl/transformers to avoid import-order warnings
+try:
+    import unsloth  # noqa: F401
+except ImportError:
+    pass
 
-Flow:
-  1. Build a HuggingFace Dataset from the rollout prompts.
-  2. Define a reward function that calls the running environment server.
-  3. Run TRL's GRPOTrainer — it generates G completions per prompt,
-     scores each via the reward function, and updates LoRA weights.
-  4. Save the final LoRA adapter.
-
-The reward function deliberately mirrors the environment's own scoring so that
-training stays consistent with the existing judge logic in Moving_Target_environment.py.
-"""
 import json
 import os
 import re
@@ -27,21 +22,41 @@ SERVER_URL = os.getenv("ENV_SERVER_URL", "http://localhost:8000/")
 # ── reward function ───────────────────────────────────────────────────────────
 
 def _parse_tool_call(text: str) -> dict | None:
-    match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
+    """Extract the first balanced JSON object from text.
+
+    Handles nested dicts (place_order payloads) by counting braces instead
+    of using a flat regex that can't match past the first closing brace.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
     return None
 
 
-def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
-    """Score each generated completion by executing it against the environment server.
+def _extract_reward(obs: dict, response_json: dict) -> float:
+    raw = obs.get("reward")
+    if raw is None:
+        raw = response_json.get("reward")
+    return float(raw) if raw is not None else 0.0
 
-    For getMerchant / ask_watchdog the reward is deterministic (matches env).
-    For place_order we make two HTTP calls: first ask_watchdog to load the schema,
-    then place_order so the environment can evaluate the payload correctly.
+
+def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
+    """Score each generated completion by calling the running environment server.
+
+    getMerchant / ask_watchdog use fixed deterministic rewards (matching env).
+    place_order pre-loads the schema with ask_watchdog then calls place_order
+    so the environment judge can validate payload + constraints.
     Plain-text completions (no tool call) receive 0.
     """
     rewards = []
@@ -56,13 +71,14 @@ def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[flo
 
         try:
             if tool == "getMerchant":
+                # Fixed reward — mirrors env's first-call bonus but stable during training
                 rewards.append(3.0)
 
             elif tool == "ask_watchdog":
                 rewards.append(-2.0)
 
             elif tool == "place_order":
-                # Pre-load the merchant schema so the environment can validate the payload
+                # Pre-load the merchant schema so the server can validate the payload
                 requests.post(
                     f"{SERVER_URL}step",
                     json={"action": {"tool": "ask_watchdog", "merchant_name": merchant}},
@@ -77,7 +93,9 @@ def _reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[flo
                     }},
                     timeout=10,
                 )
-                r = float(resp.json().get("observation", {}).get("reward") or -10.0)
+                payload = resp.json()
+                obs = payload.get("observation", {})
+                r = _extract_reward(obs, payload)
                 rewards.append(r)
 
             else:

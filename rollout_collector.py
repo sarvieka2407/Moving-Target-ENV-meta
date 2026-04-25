@@ -1,15 +1,10 @@
-"""Runs episodes with the local model as concierge and collects training data.
+"""Runs episodes with the local model as concierge and collects training data."""
+# Import unsloth FIRST before any trl/transformers to avoid import-order warnings
+try:
+    import unsloth  # noqa: F401
+except ImportError:
+    pass
 
-Each episode:
-  1. Reset the environment (randomises merchant schemas).
-  2. Persona generates a user request (OpenRouter) or use a fallback request.
-  3. Local model acts as concierge: generates tool calls in JSON format.
-  4. Tool calls are executed via HTTP against the environment server.
-  5. Rewards from each step are recorded.
-
-Returns a list of dicts  {"prompt": str, "completion": str, "reward": float}
-one entry per concierge turn.  grpo_trainer.py uses these prompts and rewards.
-"""
 import json
 import os
 import re
@@ -22,7 +17,6 @@ from model_loader import get_model_and_tokenizer
 
 MAX_STEPS_PER_EPISODE = 15
 
-# Simple fallback persona requests used when no OPENROUTER_API_KEY is set
 FALLBACK_REQUESTS = [
     "I need a Vegan meal under $40 with a flexible refund policy.",
     "Get me something Halal, budget is $50, must be refundable.",
@@ -38,7 +32,7 @@ CONCIERGE_SYSTEM_PROMPT = (
     "TOOL FORMAT — Output ONLY a JSON object (nothing else) to call a tool:\n"
     '- List merchants:  {"tool": "getMerchant"}\n'
     '- Check merchant:  {"tool": "ask_watchdog", "merchant_name": "NAME"}\n'
-    '- Place order:     {"tool": "place_order", "merchant_name": "NAME", "payload": {"field": "value", ...}}\n\n'
+    '- Place order:     {"tool": "place_order", "merchant_name": "NAME", "payload": {"field": "value"}}\n\n'
     "RULES:\n"
     "1. Always call ask_watchdog BEFORE place_order for any merchant.\n"
     "2. The place_order payload must contain EXACTLY the fields in ask_watchdog's required_fields list.\n"
@@ -48,19 +42,26 @@ CONCIERGE_SYSTEM_PROMPT = (
     "6. When the order is placed or all options are exhausted, write a plain text summary (not JSON)."
 )
 
+# Model tool name → environment server tool name
+_TOOL_NAME_MAP = {
+    "getMerchant": "get_merchants",
+    "check_merchant": "ask_watchdog",
+    "ask_watchdog": "ask_watchdog",
+    "place_order": "place_order",
+}
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _build_prompt(messages: list[dict]) -> str:
-    """Format a message list as a Qwen2.5 chat string ending with the assistant turn opener."""
-    model, tokenizer = get_model_and_tokenizer()
+    """Format a message list as a chat string ending with the assistant turn opener."""
+    _, tokenizer = get_model_and_tokenizer()
     if hasattr(tokenizer, "apply_chat_template"):
         return tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
         )
-    # Manual fallback
     text = ""
     for m in messages:
         text += f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
@@ -71,15 +72,6 @@ def _build_prompt(messages: list[dict]) -> str:
 def _generate(prompt: str, max_new_tokens: int = 256) -> str:
     """Run inference with the local model and return the new text only."""
     model, tokenizer = get_model_and_tokenizer()
-
-    # Unsloth: switch to inference mode for speed
-    if torch.cuda.is_available():
-        try:
-            from unsloth import FastLanguageModel
-            FastLanguageModel.for_inference(model)
-        except Exception:
-            pass
-
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
         output_ids = model.generate(
@@ -94,33 +86,71 @@ def _generate(prompt: str, max_new_tokens: int = 256) -> str:
 
 
 def _parse_tool_call(text: str) -> dict | None:
-    """Extract the first JSON object from model output, or None if not present."""
-    match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
+    """Extract the first balanced JSON object from model output.
+
+    Uses brace counting instead of a flat regex so nested dicts (place_order
+    payloads) are parsed correctly.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
     return None
+
+
+def _extract_reward(obs: dict, response_json: dict) -> float:
+    """Extract reward from either observation or top-level response payload."""
+    raw = obs.get("reward")
+    if raw is None:
+        raw = response_json.get("reward")
+    if raw is None:
+        return 0.0
+    return float(raw)
 
 
 def _execute_tool(tool_call: dict, server_base_url: str) -> tuple[float, str, bool]:
     """Execute a parsed tool call via the environment server.
-    Returns (reward, observation_data, episode_done).
+
+    Maps model-facing tool names to environment-server tool names,
+    then POSTs to /step and returns (reward, observation_data, episode_done).
     """
+    model_tool = tool_call.get("tool", "")
+    env_tool = _TOOL_NAME_MAP.get(model_tool, model_tool)  # fix getMerchant → get_merchants
+
+    merchant_name = tool_call.get("merchant_name")
+    if merchant_name is None and isinstance(tool_call.get("merchant_names"), list):
+        merchant_list = tool_call.get("merchant_names") or []
+        merchant_name = merchant_list[0] if merchant_list else None
+
     action = {
-        "tool": tool_call.get("tool", ""),
-        "merchant_name": tool_call.get("merchant_name", "unknown"),
+        "tool": env_tool,
+        "merchant_name": (
+            "directory"                                  # getMerchant placeholder
+            if model_tool == "getMerchant"
+            else (merchant_name or "unknown")
+        ),
         "payload": tool_call.get("payload") or {},
     }
-    # getMerchant uses "directory" as the merchant_name placeholder
-    if action["tool"] == "getMerchant":
-        action["merchant_name"] = "directory"
 
     try:
-        resp = requests.post(f"{server_base_url}step", json={"action": action}, timeout=15)
-        obs = resp.json().get("observation", {})
-        reward = float(obs.get("reward") or 0.0)
+        resp = requests.post(
+            f"{server_base_url}step",
+            json={"action": action},
+            timeout=15,
+        )
+        payload = resp.json()
+        obs = payload.get("observation", {})
+        reward = _extract_reward(obs, payload)
         data = obs.get("data", "")
         done = bool(obs.get("done", False))
         return reward, data, done
@@ -129,8 +159,11 @@ def _execute_tool(tool_call: dict, server_base_url: str) -> tuple[float, str, bo
 
 
 def _get_persona_request(server_base_url: str, fallback_idx: int) -> str:
-    """Get a persona request. Uses OpenRouter persona node if key is available."""
-    if os.getenv("OPENROUTER_API_KEY"):
+    """Get a persona request via OpenRouter, or use a hardcoded fallback."""
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    model_name = os.getenv("MODEL_NAME", "").strip()
+
+    if api_key and model_name:
         try:
             from personaAgent import persona_node
             result = persona_node({"messages": []})
@@ -139,35 +172,33 @@ def _get_persona_request(server_base_url: str, fallback_idx: int) -> str:
                     return msg.content
         except Exception as e:
             print(f"[ROLLOUT] Persona node failed ({e}), using fallback.", flush=True)
+    else:
+        if not api_key:
+            print("[ROLLOUT] OPENROUTER_API_KEY not set — using fallback persona.", flush=True)
+        if not model_name:
+            print("[ROLLOUT] MODEL_NAME not set — using fallback persona.", flush=True)
+
     return FALLBACK_REQUESTS[fallback_idx % len(FALLBACK_REQUESTS)]
 
 
 # ── main public function ──────────────────────────────────────────────────────
 
 def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
-    """Run `episodes` episodes and collect (prompt, completion, reward) per step.
-
-    Args:
-        episodes: Number of full episodes to run.
-        server_base_url: Base URL of the environment server, e.g. "http://localhost:8000/".
-
-    Returns:
-        List of dicts with keys: prompt, completion, reward.
-    """
+    """Run episodes and collect (prompt, completion, reward) per concierge step."""
     rollout_buffer: list[dict] = []
 
     for ep in range(episodes):
         print(f"[ROLLOUT] Episode {ep + 1}/{episodes}", flush=True)
 
-        # Reset environment (randomises all merchant schemas)
         try:
             requests.post(f"{server_base_url}reset", timeout=10)
         except Exception as e:
             print(f"[ROLLOUT] Reset failed: {e}", flush=True)
             continue
 
-        # Build starting conversation
         persona_request = _get_persona_request(server_base_url, ep)
+        print(f"[ROLLOUT]   Persona: {persona_request[:80]}", flush=True)
+
         messages = [
             {"role": "system", "content": CONCIERGE_SYSTEM_PROMPT},
             {"role": "user", "content": persona_request},
@@ -178,22 +209,25 @@ def collect_rollouts(episodes: int, server_base_url: str) -> list[dict]:
             prompt = _build_prompt(messages)
             completion = _generate(prompt)
 
+            # Always log what the model actually said (trimmed)
+            print(f"[ROLLOUT]   step {step + 1} model output: {completion[:120]!r}", flush=True)
+
             tool_call = _parse_tool_call(completion)
             if tool_call is None:
-                # Model gave a final text answer — episode is done
+                print(f"[ROLLOUT]   step {step + 1}: no tool call → episode end (reward 0)", flush=True)
                 rollout_buffer.append({"prompt": prompt, "completion": completion, "reward": 0.0})
                 break
 
             reward, obs_data, done = _execute_tool(tool_call, server_base_url)
             episode_reward += reward
-
-            verbose = (os.getenv("ROLLOUT_VERBOSE") or "").lower() in ("1", "true", "yes", "on")
-            if verbose:
-                print(f"  step {step + 1}: tool={tool_call.get('tool')} reward={reward}", flush=True)
+            print(
+                f"[ROLLOUT]   step {step + 1}: tool={tool_call.get('tool')!r} → "
+                f"reward={reward:.1f} done={done}",
+                flush=True,
+            )
 
             rollout_buffer.append({"prompt": prompt, "completion": completion, "reward": reward})
 
-            # Extend conversation with assistant reply + tool result
             messages.append({"role": "assistant", "content": completion})
             messages.append({"role": "user", "content": f"[Tool Result]: {obs_data}"})
 
