@@ -1,3 +1,12 @@
+---
+title: Moving Target GRPO
+emoji: "🤖"
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+pinned: false
+---
+
 # Moving Target GRPO Environment (OpenEnv + Hugging Face Space)
 
 This project is a simple GRPO training setup for a moving-target ordering environment.

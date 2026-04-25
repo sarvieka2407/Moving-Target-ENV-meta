@@ -19,8 +19,15 @@ def get_model_and_tokenizer():
     if _model is not None:
         return _model, _tokenizer
 
-    if torch.cuda.is_available():
-        _load_with_unsloth()
+    use_unsloth = (os.getenv("USE_UNSLOTH", "1").lower() in ("1", "true", "yes", "on"))
+    if torch.cuda.is_available() and use_unsloth:
+        try:
+            _load_with_unsloth()
+        except Exception as e:
+            # Keep first-time setup simple and robust on Spaces:
+            # if Unsloth/TRL versions drift, continue with plain HF+PEFT.
+            print(f"[MODEL] Unsloth load failed, falling back to HF+PEFT: {e}", flush=True)
+            _load_with_hf()
     else:
         _load_with_hf()
 
@@ -64,9 +71,14 @@ def _load_with_hf():
     hf_name = MODEL_NAME.replace("unsloth/", "")
 
     tokenizer = AutoTokenizer.from_pretrained(hf_name)
+
+    torch_dtype = torch.float32
+    if torch.cuda.is_available():
+        torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
     model = AutoModelForCausalLM.from_pretrained(
         hf_name,
-        torch_dtype=torch.float32,
+        torch_dtype=torch_dtype,
         device_map="auto",
     )
     lora_config = LoraConfig(
